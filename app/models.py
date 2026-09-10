@@ -37,6 +37,7 @@ class MeterReading(Base):
     reported_at: Mapped[DateTime] = mapped_column(DateTime, index=True)
     received_at: Mapped[DateTime] = mapped_column(DateTime, default=utcnow)
     is_outlier: Mapped[bool] = mapped_column(Boolean, default=False)      # 被去噪标记的离群点
+    denoise_evaluated: Mapped[bool] = mapped_column(Boolean, default=False)  # 去噪已评估
     jump_evaluated: Mapped[bool] = mapped_column(Boolean, default=False)  # 跳变检测已评估
 
 

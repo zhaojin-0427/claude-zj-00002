@@ -32,8 +32,13 @@ MQTT_HOST=broker.local MQTT_TOPIC='smartmeter/+/reading' python -m app.mqtt_work
 ```
 
 - **幂等接收**：`(meter_no, reported_at)` 唯一约束，重复上报返回 `duplicates` 计数，不产生重复数据、不重复触发告警；
-- 设备首次上报自动建档；设备恢复上报时自动闭环其「设备离线」告警（置为已恢复）；
+- 设备首次上报自动建档；`device_status`、房间、楼栋按"最新上报时间优先"同步（乱序补报不会用旧状态覆盖新状态）；
+- 设备恢复上报时自动闭环其「设备离线」告警（置为已恢复）——仅**新鲜读数**（上报时间落在离线窗口内）可触发恢复，陈旧补报不会；
 - 响应中直接返回本次上报新触发的告警 `alerts_triggered`。
+
+**时间约定**：`reported_at` 统一按 naive UTC 存储（带时区偏移的时间会转换为 UTC，如 `23:00+08:00` 存为 `15:00Z`）；夜间时段按本地时间判定，本地时间 = UTC + `LOCAL_UTC_OFFSET_HOURS`（默认 8，即北京时间）。
+
+**乱序补报**：补报的历史读数会触发其前后窗口的补评估——去噪、功率跳变对所有"已具备评估条件但尚未评估"的读数统一补算，持续高负荷/夜间活跃/疑似窃电对补报点及其后的读数重新评估；告警按（电表, 异常类型）未闭环去重，重复评估不会产生重复告警。
 
 ## 异常检测规则
 
@@ -48,6 +53,7 @@ MQTT_HOST=broker.local MQTT_TOPIC='smartmeter/+/reading' python -m app.mqtt_work
 **短时离群值去噪**：新读数到达后回溯评估上一条读数，若其两侧邻点均处于正常区间而中间点为
 大幅尖峰，则标记为离群点（`is_outlier=true`），后续所有检测忽略该点——单点毛刺不会触发
 功率跳变等误报。去噪判定延迟一个采样点完成，因此跳变检测也延迟一个采样点评估。
+**若尖峰在被识别为离群点之前已触发告警（如疑似窃电），该告警会自动撤销为「误报」并记录备注。**
 
 ## 告警状态机
 
@@ -89,6 +95,7 @@ pending(待确认) ──▶ investigating(核查中) ──▶ rectified(已整
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `DATABASE_URL` | `sqlite:///./smartmeter.db` | 数据库连接 |
+| `LOCAL_UTC_OFFSET_HOURS` | `8` | 本地时区偏移（夜间时段按本地时间判定） |
 | `HIGH_POWER_THRESHOLD_KW` / `HIGH_POWER_CONSECUTIVE` | `5.0` / `3` | 持续高负荷 |
 | `NIGHT_START_HOUR` / `NIGHT_END_HOUR` / `NIGHT_POWER_THRESHOLD_KW` / `NIGHT_CONSECUTIVE` | `23`/`6`/`1.0`/`2` | 夜间异常 |
 | `POWER_JUMP_THRESHOLD_KW` | `3.0` | 功率跳变 |

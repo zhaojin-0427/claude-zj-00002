@@ -96,14 +96,36 @@ def scan_offline_devices(db: Session, now: Optional[datetime] = None) -> List[Al
 
 
 def recover_offline_alerts(db: Session, device: Device, at: datetime) -> None:
-    """设备重新上报时，自动将其未闭环的离线告警置为已恢复。"""
+    """设备重新上报时，自动将其未闭环的离线告警置为已恢复。
+
+    仅应由"新鲜"读数（reported_at 在离线窗口内）触发；陈旧补报不会调用本函数。
+    resolved_at 不早于 first_detected_at，避免出现"解决早于检出"。
+    """
     alerts = (db.query(Alert)
               .filter(Alert.meter_no == device.meter_no,
                       Alert.anomaly_type == AnomalyType.DEVICE_OFFLINE,
                       Alert.status.in_(AlertStatus.OPEN))
               .all())
     for a in alerts:
+        resolved_at = max(at, a.first_detected_at)
         a.status = AlertStatus.RECOVERED
-        a.resolved_at = at
+        a.resolved_at = resolved_at
         a.note = (a.note + "\n" if a.note else "") + \
-                 f"[{at:%Y-%m-%d %H:%M:%S}] 设备恢复上报，系统自动置为已恢复"
+                 f"[{resolved_at:%Y-%m-%d %H:%M:%S}] 设备恢复上报，系统自动置为已恢复"
+
+
+def retract_alerts_caused_by_reading(db: Session, reading) -> List[Alert]:
+    """读数被判定为离群点后，撤销由它触发的未闭环告警（置为误报）。"""
+    now = utcnow()
+    alerts = (db.query(Alert)
+              .filter(Alert.meter_no == reading.meter_no,
+                      Alert.first_detected_at == reading.reported_at,
+                      Alert.anomaly_type != AnomalyType.DEVICE_OFFLINE,
+                      Alert.status.in_(AlertStatus.OPEN))
+              .all())
+    for a in alerts:
+        a.status = AlertStatus.FALSE_POSITIVE
+        a.resolved_at = now
+        a.note = (a.note + "\n" if a.note else "") + \
+                 f"[{now:%Y-%m-%d %H:%M:%S}] 触发读数被判定为短时离群点，告警自动撤销"
+    return alerts

@@ -94,7 +94,7 @@ def test_below_threshold_no_high_load_alert(client):
 
 def test_night_active(client):
     readings = [make_reading(reading=200 + 0.2 * i, power=2.0,
-                             ts=f"2026-09-10T01:{i:02d}:00") for i in (0, 5)]
+                             ts=f"2026-09-10T01:{i:02d}:00+08:00") for i in (0, 5)]
     data = post(client, readings)
     types = [a["anomaly_type"] for a in data["alerts_triggered"]]
     assert "night_active" in types
@@ -102,7 +102,7 @@ def test_night_active(client):
 
 def test_daytime_same_power_no_night_alert(client):
     readings = [make_reading(reading=200 + 0.2 * i, power=2.0,
-                             ts=f"2026-09-10T14:{i:02d}:00") for i in (0, 5)]
+                             ts=f"2026-09-10T14:{i:02d}:00+08:00") for i in (0, 5)]
     data = post(client, readings)
     assert data["alerts_triggered"] == []
 
@@ -233,7 +233,7 @@ def test_alert_query_filters(client):
                                ts=f"2026-09-10T10:{i:02d}:00") for i in (0, 5, 10)])
     post(client, [make_reading(meter="M2", room="101", building="B栋",
                                reading=200 + 0.2 * i, power=2.0,
-                               ts=f"2026-09-10T01:{i:02d}:00") for i in (0, 5)])
+                               ts=f"2026-09-10T01:{i:02d}:00+08:00") for i in (0, 5)])
 
     assert alerts_of(client, room_no="301")["total"] == 1
     assert alerts_of(client, building="B栋")["total"] == 1
@@ -254,7 +254,7 @@ def test_stats_top_rooms(client):
                                   (15, 101.5, 5.2), (20, 102.0, 8.5), (25, 102.5, 8.5)]])
     post(client, [make_reading(meter="M2", room="101", building="A栋",
                                reading=200 + 0.2 * i, power=2.0,
-                               ts=f"2026-09-10T01:{i:02d}:00") for i in (0, 5)])
+                               ts=f"2026-09-10T01:{i:02d}:00+08:00") for i in (0, 5)])
     data = client.get("/api/v1/stats/top-rooms", params={"days": 7}).json()["data"]
     assert data["items"][0]["room_no"] == "301"
     assert data["items"][0]["alert_count"] == 2
@@ -282,3 +282,79 @@ def test_stats_compliance(client):
     assert data["compliant_rooms"] == 1
     assert data["compliance_rate"] == 0.5
     assert data["by_building"][0]["building"] == "A栋"
+
+
+# ---------- 缺陷回归 ----------
+
+def test_device_status_synced_from_latest_reading(client):
+    """bug1: device_status=fault 应同步到设备档案，且陈旧补报不覆盖最新状态。"""
+    post(client, [make_reading(reading=100.0, ts="2026-09-10T10:00:00", status="fault")])
+    dev = client.get("/api/v1/devices").json()["data"]["items"][0]
+    assert dev["status"] == "fault"
+    # 更早时刻的补报（status=normal）不应覆盖最新状态
+    post(client, [make_reading(reading=99.0, ts="2026-09-10T09:00:00", status="normal")])
+    dev = client.get("/api/v1/devices").json()["data"]["items"][0]
+    assert dev["status"] == "fault"
+
+
+def test_night_active_with_timezone_offset(client):
+    """bug2: 北京时间 23:00+08:00 的连续高功率应触发夜间异常。"""
+    readings = [make_reading(reading=200 + 0.2 * i, power=2.0,
+                             ts=f"2026-09-10T23:0{i}:00+08:00") for i in (0, 5)]
+    data = post(client, readings)
+    types = [a["anomaly_type"] for a in data["alerts_triggered"]]
+    assert "night_active" in types
+
+
+def test_outlier_retracts_theft_alert(client):
+    """bug3: 尖峰先触发疑似窃电，被判定为离群点后告警应自动撤销为误报。"""
+    readings = [
+        make_reading(reading=100.0, power=1.0, ts="2026-09-10T10:00:00"),
+        make_reading(reading=100.25, power=9.0, ts="2026-09-10T10:15:00"),
+        make_reading(reading=100.5, power=1.0, ts="2026-09-10T10:30:00"),
+    ]
+    post(client, readings)
+    items = alerts_of(client, anomaly_type="suspected_theft")["items"]
+    assert len(items) == 1
+    assert items[0]["status"] == "false_positive"
+    assert "离群" in items[0]["note"]
+    # 离群点本身有标记
+    resp = client.get("/api/v1/readings", params={"meter_no": "M1001"})
+    assert any(r["is_outlier"] and r["power"] == 9.0 for r in resp.json()["data"]["items"])
+
+
+def test_out_of_order_backfill_triggers_jump(client):
+    """bug4: 乱序补报后完整序列 1→5→5.2kW，应补检出功率跳变。"""
+    post(client, [make_reading(reading=100.0, power=1.0, ts="2026-09-10T10:00:00"),
+                  make_reading(reading=100.9, power=5.2, ts="2026-09-10T10:10:00")])
+    assert alerts_of(client, anomaly_type="power_jump")["total"] == 0
+    # 补报中间的 5kW 读数
+    data = post(client, [make_reading(reading=100.45, power=5.0,
+                                      ts="2026-09-10T10:05:00")])
+    types = [a["anomaly_type"] for a in data["alerts_triggered"]]
+    assert "power_jump" in types
+    alert = alerts_of(client, anomaly_type="power_jump")["items"][0]
+    assert alert["first_detected_at"].startswith("2026-09-10T10:05")
+
+
+def test_stale_backfill_does_not_recover_offline_alert(client):
+    """bug5: 陈旧补报不应闭环离线告警；新鲜上报才恢复且解决时间不早于检出时间。"""
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    post(client, [make_reading(reading=700.0, power=1.0,
+                               ts=(now - timedelta(minutes=60)).isoformat())])
+    alert = client.post("/api/v1/alerts/scan-offline").json()["data"]["new_alerts"][0]
+
+    # 陈旧补报（仍超出离线窗口）：告警保持打开，设备仍显示离线
+    post(client, [make_reading(reading=700.5, power=1.0,
+                               ts=(now - timedelta(minutes=50)).isoformat())])
+    detail = client.get(f"/api/v1/alerts/{alert['id']}").json()["data"]
+    assert detail["status"] == "pending"
+    dev = client.get("/api/v1/devices").json()["data"]["items"][0]
+    assert dev["online"] is False
+
+    # 新鲜上报：告警恢复，且 resolved_at 不早于 first_detected_at
+    post(client, [make_reading(reading=701.0, power=1.0, ts=now.isoformat())])
+    detail = client.get(f"/api/v1/alerts/{alert['id']}").json()["data"]
+    assert detail["status"] == "recovered"
+    assert detail["resolved_at"] >= detail["first_detected_at"]

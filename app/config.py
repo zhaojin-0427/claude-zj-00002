@@ -13,6 +13,8 @@ def _float(name: str, default: float) -> float:
 class Settings:
     # ---- 数据接收 ----
     DATABASE_URL: str = os.getenv("DATABASE_URL", "sqlite:///./smartmeter.db")
+    # 本地时区相对 UTC 的偏移小时数（夜间时段按本地时间判定）
+    LOCAL_UTC_OFFSET_HOURS: int = _int("LOCAL_UTC_OFFSET_HOURS", 8)
 
     # ---- 持续高负荷 ----
     HIGH_POWER_THRESHOLD_KW: float = _float("HIGH_POWER_THRESHOLD_KW", 5.0)   # 高功率阈值(kW)

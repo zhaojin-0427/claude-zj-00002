@@ -1,8 +1,10 @@
 """数据接收服务：幂等写入 + 触发检测。"""
+from datetime import timedelta
 from typing import List
 
 from sqlalchemy.orm import Session
 
+from ..config import settings
 from ..models import Alert, Device, MeterReading
 from ..schemas import ReadingIn
 from ..utils import utcnow
@@ -11,17 +13,20 @@ from .alert_service import recover_offline_alerts
 
 
 def _upsert_device(db: Session, item: ReadingIn) -> Device:
+    """建档/更新设备。仅当读数不旧于已知最近上报时间时才更新设备状态，
+    避免乱序补报用旧状态覆盖最新状态。"""
     device = db.query(Device).filter(Device.meter_no == item.meter_no).first()
     if device is None:
         device = Device(meter_no=item.meter_no, room_no=item.room_no,
-                        building=item.building, last_seen_at=item.reported_at)
+                        building=item.building, status=item.device_status,
+                        last_seen_at=item.reported_at)
         db.add(device)
         db.flush()
-    else:
+    elif device.last_seen_at is None or item.reported_at >= device.last_seen_at:
         device.room_no = item.room_no
         device.building = item.building
-        if device.last_seen_at is None or item.reported_at > device.last_seen_at:
-            device.last_seen_at = item.reported_at
+        device.status = item.device_status
+        device.last_seen_at = item.reported_at
     return device
 
 
@@ -44,7 +49,11 @@ def ingest_readings(db: Session, items: List[ReadingIn]) -> dict:
             continue
 
         device = _upsert_device(db, item)
-        recover_offline_alerts(db, device, item.reported_at)
+        # 仅"新鲜"读数（上报时间落在离线窗口内）才能闭环离线告警；
+        # 陈旧补报不代表设备当前已恢复在线
+        now = utcnow()
+        if item.reported_at >= now - timedelta(minutes=settings.OFFLINE_MINUTES):
+            recover_offline_alerts(db, device, now)
 
         reading = MeterReading(
             meter_no=item.meter_no, room_no=item.room_no, building=item.building,
