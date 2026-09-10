@@ -8,7 +8,7 @@
 """
 import json
 from datetime import datetime, timedelta
-from typing import List, Optional
+from typing import List
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
@@ -73,8 +73,10 @@ def trial_run(db: Session, meter_no: str, start: datetime,
                        .filter(MeterReading.meter_no == meter_no)
                        .order_by(MeterReading.reported_at.asc())
                        .all())
-    in_range = [r for r in source_readings if start <= r.reported_at <= end]
-    if not in_range:
+    # 试跑严格限定在请求区间内：区间外的读数（即使在试跑后新增）不进入沙箱，
+    # 不参与去噪邻点/连续计数等上下文，保证同一区间试跑结果稳定可复现。
+    replay_rows = [r for r in source_readings if start <= r.reported_at <= end]
+    if not replay_rows:
         raise ApiException(40401, "指定时间范围内该电表没有历史读数", http_status=404)
 
     # ---- 隔离的内存沙箱：与正式库完全隔离 ----
@@ -87,13 +89,16 @@ def trial_run(db: Session, meter_no: str, start: datetime,
                                   expire_on_commit=False)
     sb = SandboxSession()
     try:
+        # 沙箱设备使用区间起点读数的归属位置，保证告警归属与命中策略一致
+        first = replay_rows[0]
         sb.add(Device(
-            id=device.id, meter_no=device.meter_no, room_no=device.room_no,
-            building=device.building, status=device.status,
+            id=device.id, meter_no=device.meter_no,
+            room_no=first.room_no or device.room_no,
+            building=first.building or device.building,
+            status=device.status,
             last_seen_at=device.last_seen_at, created_at=device.created_at,
         ))
-        # 按真实到达顺序（时间序）逐条回放；评估标记全部重置，去噪/检测重新执行
-        for r in source_readings:
+        for r in replay_rows:
             sb.add(MeterReading(
                 meter_no=r.meter_no, room_no=r.room_no, building=r.building,
                 reading=r.reading, power=r.power, device_status=r.device_status,
@@ -128,9 +133,7 @@ def trial_run(db: Session, meter_no: str, start: datetime,
                 .all())
 
         # 逐条回放，完整复用生产检测管线（含乱序补评估/去噪撤销逻辑）
-        for i in range(len(rows)):
-            sub = rows[:i + 1]
-            current = sub[-1]
+        for current in rows:
             detection.process_reading(sb, sb_device, current)
 
         # 设备离线：以 end 时刻为"现在"模拟一次离线判定（只读，不改动设备状态）
@@ -142,23 +145,20 @@ def trial_run(db: Session, meter_no: str, start: datetime,
                     .filter(MeterReading.meter_no == meter_no,
                             MeterReading.is_outlier.is_(True)).count())
 
-        # 仅汇报落在请求时间范围内的检出
-        predicted = [a for a in sb_alerts
-                     if start <= a.first_detected_at <= end]
-        for a in offline_hits:
-            if start <= a.first_detected_at <= end and \
-                    not any(x.anomaly_type == AnomalyType.DEVICE_OFFLINE
-                            for x in predicted):
-                predicted.append(a)
+        # 回放数据已限定在请求区间，检出时间必然落在区间内
+        predicted = list(sb_alerts)
+        if offline_hits and not any(a.anomaly_type == AnomalyType.DEVICE_OFFLINE
+                                    for a in predicted):
+            predicted += offline_hits
         predicted.sort(key=lambda a: a.first_detected_at)
 
         return {
             "meter_no": meter_no,
-            "room_no": device.room_no,
-            "building": device.building,
+            "room_no": sb_device.room_no,
+            "building": sb_device.building,
             "range_start": start.isoformat(),
             "range_end": end.isoformat(),
-            "readings_in_range": len(in_range),
+            "readings_in_range": len(replay_rows),
             "readings_replayed": len(rows),
             "outliers_marked": outliers,
             "evaluated_at": end.isoformat(),
@@ -175,15 +175,17 @@ def trial_run(db: Session, meter_no: str, start: datetime,
 def _evaluate_offline_at(sb: Session, device: Device,
                          at: datetime) -> List[Alert]:
     """在沙箱中按 at 时刻的策略判定设备离线（不提交、不改设备）。"""
-    policy = policy_service.resolve_policy(
-        sb, device.meter_no, device.room_no, device.building, at)
-    rule = policy.rule(AnomalyType.DEVICE_OFFLINE)
-    if not rule.get("enabled", True) or not policy.is_effective_at(at):
-        return []
     last_seen = (sb.query(MeterReading)
                  .filter(MeterReading.meter_no == device.meter_no)
                  .order_by(MeterReading.reported_at.desc()).first())
     if last_seen is None:
+        return []
+    loc_room = last_seen.room_no or device.room_no
+    loc_building = last_seen.building or device.building
+    policy = policy_service.resolve_policy(
+        sb, device.meter_no, loc_room, loc_building, at)
+    rule = policy.rule(AnomalyType.DEVICE_OFFLINE)
+    if not rule.get("enabled", True) or not policy.is_effective_at(at):
         return []
     cutoff = at - timedelta(minutes=rule["offline_minutes"])
     if last_seen.reported_at >= cutoff:
@@ -197,5 +199,7 @@ def _evaluate_offline_at(sb: Session, device: Device,
                f"未上报（{tag}，试跑模拟）",
         detected_at=at,
         policy=policy,
+        room_no=loc_room,
+        building=loc_building,
     )
     return [alert] if created else []

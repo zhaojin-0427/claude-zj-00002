@@ -1,9 +1,14 @@
 from sqlalchemy import (Boolean, DateTime, Float, Index, Integer, String,
-                        Text, UniqueConstraint)
+                        Text, UniqueConstraint, text)
 from sqlalchemy.orm import Mapped, mapped_column
 
-from .database import Base
+from .database import Base, DATABASE_URL
 from .utils import utcnow
+
+
+def _supports_partial_index(url: str) -> bool:
+    """SQLite/PostgreSQL 支持带 WHERE 的部分唯一索引（电表级策略按表号唯一）。"""
+    return url.startswith("sqlite") or url.startswith(("postgresql://", "postgresql+"))
 
 
 class Device(Base):
@@ -49,11 +54,22 @@ class DetectionStrategy(Base):
     发布前对该记录的修改不影响线上检测。
     """
     __tablename__ = "detection_strategies"
-    __table_args__ = (
-        UniqueConstraint("scope", "building", "room_no", "meter_no",
-                         name="uq_strategy_scope"),
-        Index("ix_strategy_enabled", "enabled"),
-    )
+
+    if _supports_partial_index(DATABASE_URL):
+        __table_args__ = (
+            UniqueConstraint("scope", "building", "room_no", "meter_no",
+                             name="uq_strategy_scope"),
+            Index("uq_strategy_meter_no", "meter_no", unique=True,
+                  sqlite_where=text("scope = 'meter'"),
+                  postgresql_where=text("scope = 'meter'")),
+            Index("ix_strategy_enabled", "enabled"),
+        )
+    else:
+        __table_args__ = (
+            UniqueConstraint("scope", "building", "room_no", "meter_no",
+                             name="uq_strategy_scope"),
+            Index("ix_strategy_enabled", "enabled"),
+        )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(128))

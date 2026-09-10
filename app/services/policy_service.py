@@ -9,6 +9,7 @@
   后续策略变更/重新发布不会影响历史告警。
 """
 import json
+import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
@@ -18,7 +19,7 @@ from sqlalchemy.orm import Session
 from ..config import settings
 from ..constants import AnomalyType, StrategyScope
 from ..exceptions import ApiException
-from ..models import DetectionStrategy, DetectionStrategyVersion
+from ..models import DetectionStrategy, DetectionStrategyVersion, Device
 from ..utils import utcnow
 
 # 各异常类型的规则字段：(字段, 类型, 最小值, 最大值)；enabled 统一处理
@@ -117,6 +118,8 @@ def normalize_rules(rules_in: Optional[dict]) -> dict:
                 value = kind(value)
             except (TypeError, ValueError):
                 raise ApiException(40000, f"rules.{atype}.{key} 必须为 {kind.__name__}")
+            if isinstance(value, float) and not math.isfinite(value):
+                raise ApiException(40000, f"rules.{atype}.{key} 必须为有限数值（NaN/Infinity 非法）")
             if lo is not None and value < lo:
                 raise ApiException(40000, f"rules.{atype}.{key} 不能小于 {lo}")
             if hi is not None and value > hi:
@@ -171,22 +174,29 @@ def normalize_periods(periods_in: Optional[list]) -> List[dict]:
 
 
 def period_is_effective(periods: List[dict], ts: datetime) -> bool:
-    """判断 ts（naive UTC）是否落在生效时段内；periods 为空表示全天。"""
+    """判断 ts（naive UTC）是否落在生效时段内；periods 为空表示全天。
+
+    跨夜时段（start > end，如周一 23:00-次日 06:00）在次日凌晨（周二 00:00-06:00）
+    判定时，需回溯前一天的星期配置——该时段仍属于周一那条策略。
+    """
     if not periods:
         return True
     local = ts + timedelta(hours=settings.LOCAL_UTC_OFFSET_HOURS)
     minutes = local.hour * 60 + local.minute
-    dow = local.isoweekday()  # 周一=1 ... 周日=7
+    dow = local.isoweekday()       # 周一=1 ... 周日=7
+    prev_dow = dow - 1 or 7        # 前一天（周一时回绕到周日=7）
     for p in periods:
-        if dow not in p["days_of_week"]:
-            continue
+        days = p["days_of_week"]
         start = _parse_hhmm(p["start"])
         end = _parse_hhmm(p["end"])
         if start < end:
-            if start <= minutes < end:
+            # 不跨夜：仅当天
+            if dow in days and start <= minutes < end:
                 return True
-        else:  # 跨夜：23:00-06:00 => >=23:00 或 <06:00
-            if minutes >= start or minutes < end:
+        else:
+            # 跨夜：当天晚间段 或 次日凌晨段（后者归属前一天的配置）
+            if (minutes >= start and dow in days) or \
+               (minutes < end and prev_dow in days):
                 return True
     return False
 
@@ -312,7 +322,8 @@ def resolve_policy(db: Session, meter_no: str, room_no: str,
 
 # ----------------------------- 草稿 CRUD -----------------------------
 
-def _scope_targets(scope: str, building: str, room_no: str, meter_no: str) -> dict:
+def _scope_targets(db: Session, scope: str, building: str, room_no: str,
+                   meter_no: str) -> dict:
     if scope == StrategyScope.GLOBAL:
         return {"building": "", "room_no": "", "meter_no": ""}
     if scope == StrategyScope.BUILDING:
@@ -326,7 +337,13 @@ def _scope_targets(scope: str, building: str, room_no: str, meter_no: str) -> di
     if scope == StrategyScope.METER:
         if not meter_no:
             raise ApiException(40000, "电表级策略必须提供 meter_no")
-        return {"building": building or "", "room_no": room_no or "", "meter_no": meter_no}
+        # 电表级策略只按表号唯一；楼栋/房间仅作展示，优先取设备档案，
+        # 避免调用方传入任意位置导致同表多条策略或命中归属串楼
+        loc_b, loc_r = building or "", room_no or ""
+        dev = db.query(Device).filter(Device.meter_no == meter_no).first()
+        if dev is not None:
+            loc_b, loc_r = dev.building, dev.room_no
+        return {"building": loc_b, "room_no": loc_r, "meter_no": meter_no}
     raise ApiException(40000, f"非法策略层级，可选: {StrategyScope.ALL}")
 
 
@@ -336,29 +353,43 @@ def create_strategy(db: Session, *, name: str, scope: str, building: str = "",
                     enabled: bool = True) -> DetectionStrategy:
     if scope not in StrategyScope.ALL:
         raise ApiException(40000, f"非法策略层级，可选: {StrategyScope.ALL}")
-    targets = _scope_targets(scope, building, room_no, meter_no)
+    targets = _scope_targets(db, scope, building, room_no, meter_no)
     rules_norm = normalize_rules(rules)
     periods_norm = normalize_periods(effective_periods)
 
-    dup = (db.query(DetectionStrategy)
-           .filter(DetectionStrategy.scope == scope,
-                   DetectionStrategy.building == targets["building"],
-                   DetectionStrategy.room_no == targets["room_no"],
-                   DetectionStrategy.meter_no == targets["meter_no"])
-           .first())
-    if dup:
+    # 唯一性按层级归一化后的作用域目标；电表级只认表号，与传入的楼栋/房间无关
+    dup_q = db.query(DetectionStrategy).filter(DetectionStrategy.scope == scope)
+    if scope == StrategyScope.GLOBAL:
+        dup_q = dup_q.filter(DetectionStrategy.building == "",
+                             DetectionStrategy.room_no == "",
+                             DetectionStrategy.meter_no == "")
+    elif scope == StrategyScope.BUILDING:
+        dup_q = dup_q.filter(DetectionStrategy.building == targets["building"],
+                             DetectionStrategy.room_no == "",
+                             DetectionStrategy.meter_no == "")
+    elif scope == StrategyScope.ROOM:
+        dup_q = dup_q.filter(DetectionStrategy.building == targets["building"],
+                             DetectionStrategy.room_no == targets["room_no"],
+                             DetectionStrategy.meter_no == "")
+    else:  # METER：仅按表号判重
+        dup_q = dup_q.filter(DetectionStrategy.meter_no == targets["meter_no"])
+    if dup_q.first():
         raise ApiException(40000, "该作用域已存在策略，请直接编辑或使用查询接口定位")
 
     strategy = DetectionStrategy(
         name=name, scope=scope,
         building=targets["building"], room_no=targets["room_no"],
         meter_no=targets["meter_no"],
-        rules_json=json.dumps(rules_norm, ensure_ascii=False),
+        rules_json=json.dumps(rules_norm, ensure_ascii=False, allow_nan=False),
         periods_json=json.dumps(periods_norm, ensure_ascii=False),
         enabled=enabled, published_version=0, current_version_id=None,
     )
     db.add(strategy)
-    db.commit()
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
     db.refresh(strategy)
     return strategy
 
@@ -380,12 +411,17 @@ def update_strategy(db: Session, strategy_id: int, *, name: Optional[str] = None
             raise ApiException(40000, "策略名称不能为空")
         strategy.name = name
     if rules is not None:
-        strategy.rules_json = json.dumps(normalize_rules(rules), ensure_ascii=False)
+        strategy.rules_json = json.dumps(normalize_rules(rules),
+                                         ensure_ascii=False, allow_nan=False)
     if effective_periods is not None:
         strategy.periods_json = json.dumps(normalize_periods(effective_periods),
                                            ensure_ascii=False)
     _invalidate_cache(db)
-    db.commit()
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
     db.refresh(strategy)
     return strategy
 

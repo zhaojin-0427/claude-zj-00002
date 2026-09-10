@@ -111,6 +111,8 @@ def evaluate_pending_jump(db: Session, device: Device, meter_no: str) -> List[Al
                        f"（变化 {delta:.2f}kW，阈值 {threshold}kW，{tag}）",
                 detected_at=r.reported_at,
                 policy=policy,
+                room_no=r.room_no or device.room_no,
+                building=r.building or device.building,
             )
             if created:
                 triggered.append(alert)
@@ -145,6 +147,8 @@ def check_sustained_high_load(db: Session, device: Device,
                f"当前 {current.power}kW，{tag}）",
         detected_at=current.reported_at,
         policy=policy,
+        room_no=current.room_no or device.room_no,
+        building=current.building or device.building,
     )
     return [alert] if created else []
 
@@ -180,6 +184,8 @@ def check_night_active(db: Session, device: Device,
                f"连续 {n} 次功率超过 {threshold}kW，当前 {current.power}kW（{tag}）",
         detected_at=current.reported_at,
         policy=policy,
+        room_no=current.room_no or device.room_no,
+        building=current.building or device.building,
     )
     return [alert] if created else []
 
@@ -212,6 +218,8 @@ def check_suspected_theft(db: Session, device: Device,
                    f"疑似表计被篡改（{tag}）",
             detected_at=current.reported_at,
             policy=policy,
+            room_no=current.room_no or device.room_no,
+            building=current.building or device.building,
         )
         return [alert] if created else []
 
@@ -229,6 +237,8 @@ def check_suspected_theft(db: Session, device: Device,
                    f"表计增量仅 {actual_kwh:.2f}kWh，疑似窃电（{tag}）",
             detected_at=current.reported_at,
             policy=policy,
+            room_no=current.room_no or device.room_no,
+            building=current.building or device.building,
         )
         return [alert] if created else []
     return []

@@ -393,21 +393,48 @@ def test_trial_run_uses_published_policy_and_range_filter(client):
                                                        "consecutive": 2}})
     publish(client, m["id"])
 
+    # 窄区间只含 10:10 一条：回放严格限定区间，区间外 10:00/10:05 不参与连续计数
     result = client.post(f"{BASE}/trial-run", json={
         "meter_no": "M1001",
         "start": "2026-09-09T10:09:00", "end": "2026-09-09T10:11:00"}).json()["data"]
-    # 命中时刻 10:05 落在范围外 -> 范围过滤后不返回，但回放仍使用全部历史做上下文
-    assert result["readings_replayed"] == 3
+    assert result["readings_in_range"] == 1
+    assert result["readings_replayed"] == 1
     assert all(a["anomaly_type"] != "sustained_high_load"
                for a in result["predicted_anomalies"])
 
+    # 完整区间：连续 2 次命中电表级策略
     full = client.post(f"{BASE}/trial-run", json={
         "meter_no": "M1001",
         "start": "2026-09-09T10:00:00", "end": "2026-09-09T10:10:00"}).json()["data"]
+    assert full["readings_replayed"] == 3
     hit = next(a for a in full["predicted_anomalies"]
                if a["anomaly_type"] == "sustained_high_load")
     assert hit["hit_strategy"]["scope"] == "meter"
     assert hit["hit_strategy"]["rule"]["threshold_kw"] == 4.0
+
+
+def test_trial_range_is_stable_when_new_reading_arrives_outside(client):
+    """bug: 同一区间试跑结果不应被区间外新增读数（去噪邻点/上下文）改变。"""
+    post_readings(client, [
+        make_reading(reading=100.0, power=1.0, ts="2026-09-09T10:00:00"),
+        make_reading(reading=100.5, power=9.0, ts="2026-09-09T10:05:00"),
+        make_reading(reading=101.0, power=1.0, ts="2026-09-09T10:10:00"),
+    ])
+
+    def run():
+        return client.post(f"{BASE}/trial-run", json={
+            "meter_no": "M1001",
+            "start": "2026-09-09T10:00:00",
+            "end": "2026-09-09T10:10:00"}).json()["data"]
+
+    before = run()
+    # 区间后新增读数，且其 power 会改变 10:10 之后的去噪上下文
+    post_readings(client, [
+        make_reading(reading=101.5, power=1.0, ts="2026-09-09T10:20:00")])
+    after = run()
+    assert after["readings_replayed"] == before["readings_replayed"] == 3
+    assert [a["anomaly_type"] for a in after["predicted_anomalies"]] == \
+           [a["anomaly_type"] for a in before["predicted_anomalies"]]
 
 
 def test_trial_run_validates_inputs(client):
@@ -438,3 +465,188 @@ def test_unified_response_shape_for_strategy_apis(client):
                                    "end": "2026-01-01T00:00:00"})):
         body = resp.json()
         assert set(body.keys()) == {"code", "message", "data"}
+
+
+# ---------- 用户反馈的 6 个缺陷回归 ----------
+
+def test_bug_overnight_period_monday_to_tuesday(client):
+    """bug1: 周一 23:00-次日06:00 的策略在周二 01:00 必须仍生效（回溯前一天星期），
+    周日/周三凌晨不得误命中。"""
+    g = create_strategy(client, name="全局夜间禁用", scope="global",
+                        rules={"night_active": {"enabled": False}})
+    publish(client, g["id"])
+    m = create_strategy(
+        client, name="电表夜间", scope="meter", meter_no="M1001",
+        rules={"night_active": {"enabled": True, "threshold_kw": 1.0,
+                                "consecutive": 2, "night_start_hour": 23,
+                                "night_end_hour": 6}},
+        # 本地时间周一 23:00 - 次日（周二）06:00
+        effective_periods=[{"days_of_week": [1], "start": "23:00", "end": "06:00"}])
+    publish(client, m["id"])
+
+    # 周二本地 00:55/01:00 = UTC 周一 16:55/17:00：连续两次 2kW 命中
+    data = post_readings(client, [
+        make_reading(reading=200.0, power=2.0, ts="2026-09-14T16:55:00Z"),
+        make_reading(reading=200.2, power=2.0, ts="2026-09-14T17:00:00Z"),
+    ])
+    assert any(a["anomaly_type"] == "night_active"
+               for a in data["alerts_triggered"]), data
+
+    # 周三本地 01:00 = UTC 周二 17:00：不属于周一跨夜段，回退全局（关闭）不命中
+    data = post_readings(client, [
+        make_reading(meter="M1002", reading=200.0, power=2.0,
+                     ts="2026-09-15T17:00:00Z"),
+        make_reading(meter="M1002", reading=200.2, power=2.0,
+                     ts="2026-09-15T17:05:00Z"),
+    ])
+    assert data["alerts_triggered"] == [], data
+
+    # 周日本地 01:00 = UTC 周六 17:00（2026-09-12）：同样不命中
+    data = post_readings(client, [
+        make_reading(meter="M1003", reading=200.0, power=2.0,
+                     ts="2026-09-12T17:00:00Z"),
+        make_reading(meter="M1003", reading=200.2, power=2.0,
+                     ts="2026-09-12T17:05:00Z"),
+    ])
+    assert data["alerts_triggered"] == [], data
+
+    chain = client.get(f"{BASE}/effective",
+                       params={"meter_no": "M1001",
+                               "at": "2026-09-14T17:00:00Z"}).json()["data"]
+    assert chain["selected_scope"] == "meter"
+
+
+def test_bug_duplicate_meter_strategy_rejected(client):
+    """bug3: 同表号即便传入不同楼栋/房间也只能有一条电表级策略。"""
+    # 先建档（A栋/101）
+    post_readings(client, [make_reading(meter="M77", room="101", building="A栋",
+                                        ts="2026-09-09T10:00:00")])
+    s1 = create_strategy(client, name="第一条", scope="meter", meter_no="M77")
+    publish(client, s1["id"])
+    # 伪造 B栋/202 位置重复创建
+    resp = client.post(BASE, json={"name": "第二条", "scope": "meter",
+                                   "meter_no": "M77", "building": "B栋",
+                                   "room_no": "202"})
+    assert resp.status_code == 400 and resp.json()["code"] == 40000
+
+    # 电表级策略的展示位置以设备档案为准（A栋/101），不会串到 B栋/202
+    detail = client.get(f"{BASE}?scope=meter&meter_no=M77").json()["data"]
+    assert detail["total"] == 1
+    assert detail["items"][0]["building"] == "A栋"
+    assert detail["items"][0]["room_no"] == "101"
+    # 用 B栋/202 查有效策略，不会命中这条只属于 M77 的策略
+    chain = client.get(f"{BASE}/effective",
+                       params={"meter_no": "M77", "building": "B栋",
+                               "room_no": "202",
+                               "at": "2026-09-09T10:00:00"}).json()["data"]
+    assert chain["selected_scope"] == "meter"  # 电表级只认表号，与传入位置无关
+    # 但另一块表 B栋/202 的电表不会命中
+    other = client.get(f"{BASE}/effective",
+                       params={"meter_no": "M88", "building": "B栋",
+                               "room_no": "202",
+                               "at": "2026-09-09T10:00:00"}).json()["data"]
+    assert other["selected_is_default"] is True
+
+
+def test_bug_redetection_keeps_v1_detail_and_snapshot(client):
+    """bug4: v1 未闭环告警在 v2 发布后再次命中，版本/快照/判定详情保持 v1。"""
+    s = create_strategy(client, name="电表", scope="meter", meter_no="M1001",
+                        rules={"sustained_high_load": {"threshold_kw": 5.0,
+                                                       "consecutive": 2}})
+    publish(client, s["id"])
+    post_readings(client, [
+        make_reading(reading=100.0, power=6.0, ts="2026-09-09T10:00:00"),
+        make_reading(reading=100.5, power=6.0, ts="2026-09-09T10:05:00"),
+    ])
+    alert = client.get("/api/v1/alerts",
+                       params={"anomaly_type": "sustained_high_load"}
+                       ).json()["data"]["items"][0]
+    v1_detail, v1_snapshot = alert["detail"], alert["strategy_snapshot"]
+    assert v1_snapshot["version"] == 1 and "5.0kW" in v1_detail
+
+    # 发布 v2（阈值 3.0），再次命中（3.5kW）
+    client.put(f"{BASE}/{s['id']}",
+               json={"rules": {"sustained_high_load": {"threshold_kw": 3.0,
+                                                       "consecutive": 2}}})
+    publish(client, s["id"])
+    post_readings(client, [
+        make_reading(reading=101.0, power=3.5, ts="2026-09-09T11:00:00"),
+        make_reading(reading=101.3, power=3.5, ts="2026-09-09T11:05:00"),
+    ])
+    items = client.get("/api/v1/alerts",
+                       params={"anomaly_type": "sustained_high_load"}
+                       ).json()["data"]["items"]
+    assert len(items) == 1  # 去重，不新增
+    kept = items[0]
+    assert kept["detail"] == v1_detail
+    assert kept["strategy_snapshot"] == v1_snapshot
+    assert kept["strategy_snapshot"]["rule"]["threshold_kw"] == 5.0
+    assert kept["last_detected_at"] >= "2026-09-09T11:05"
+
+
+def test_bug_trial_alert_location_matches_hit_policy(client):
+    """bug5: 设备换楼后试跑历史数据，告警归属历史读数位置，与命中策略一致。"""
+    # 历史读数全部在 A栋/101
+    post_readings(client, [
+        make_reading(meter="M1001", room="101", building="A栋",
+                     reading=100 + 0.5 * i, power=6.0,
+                     ts=f"2026-09-09T10:{mm:02d}:00")
+        for i, mm in enumerate((0, 5, 10))])
+    # 新读数把设备档案刷到 B栋/202
+    post_readings(client, [
+        make_reading(meter="M1001", room="202", building="B栋",
+                     reading=102.0, power=0.5, ts="2026-09-11T08:00:00")])
+    room_s = create_strategy(client, name="A栋101", scope="room",
+                             building="A栋", room_no="101",
+                             rules={"sustained_high_load": {"threshold_kw": 4.0,
+                                                            "consecutive": 2}})
+    publish(client, room_s["id"])
+
+    result = client.post(f"{BASE}/trial-run", json={
+        "meter_no": "M1001",
+        "start": "2026-09-09T10:00:00",
+        "end": "2026-09-09T10:10:00"}).json()["data"]
+    hits = [a for a in result["predicted_anomalies"]
+            if a["anomaly_type"] == "sustained_high_load"]
+    assert hits, result
+    hit = hits[0]
+    assert hit["building"] == "A栋" and hit["room_no"] == "101"
+    assert hit["hit_strategy"]["scope"] == "room"
+    assert hit["hit_strategy"]["scope_target"] == {"building": "A栋",
+                                                   "room_no": "101"}
+
+
+def test_bug_nan_threshold_rejected_and_not_persisted(client):
+    """bug6: NaN/Infinity 阈值返回 40000、不落库，不污染后续查询与全局策略创建。"""
+    import json as _json
+
+    def raw_post(payload):
+        return client.post(BASE, content=_json.dumps(payload, allow_nan=True),
+                           headers={"content-type": "application/json"})
+
+    resp = raw_post({"name": "坏策略", "scope": "global",
+                     "rules": {"power_jump": {"threshold_kw": float("nan")}}})
+    assert resp.status_code == 400 and resp.json()["code"] == 40000
+    assert "NaN" in resp.json()["message"] or "有限" in resp.json()["message"]
+
+    resp = raw_post({"name": "无穷", "scope": "global",
+                     "rules": {"power_jump": {"threshold_kw": float("inf")}}})
+    assert resp.status_code == 400 and resp.json()["code"] == 40000
+
+    # 没有脏策略落库：列表查询正常，全局策略仍可创建
+    assert client.get(BASE).json()["data"]["total"] == 0
+    ok_resp = client.post(BASE, json={"name": "正常全局", "scope": "global"})
+    assert ok_resp.status_code == 200
+    listed = client.get(BASE, params={"scope": "global"}).json()["data"]
+    assert listed["total"] == 1
+
+    # 编辑接口同样拒绝 NaN，且不污染既有策略
+    sid = ok_resp.json()["data"]["id"]
+    resp = client.put(f"{BASE}/{sid}",
+                      content=_json.dumps(
+                          {"rules": {"power_jump": {"threshold_kw": float("nan")}}},
+                          allow_nan=True),
+                      headers={"content-type": "application/json"})
+    assert resp.status_code == 400 and resp.json()["code"] == 40000
+    detail = client.get(f"{BASE}/{sid}").json()["data"]
+    assert detail["rules"]["power_jump"]["threshold_kw"] == 3.0

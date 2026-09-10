@@ -1,9 +1,23 @@
 from datetime import datetime, timezone
+import math
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .constants import AlertStatus, AnomalyType, StrategyScope
+
+
+def _reject_non_finite(obj: Any, path: str) -> Any:
+    """递归拒绝 JSON 不支持的 NaN/Infinity（pydantic float 默认放行 NaN）。"""
+    if isinstance(obj, float) and not math.isfinite(obj):
+        raise ValueError(f"{path} 必须为有限数值（NaN/Infinity 非法）")
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            _reject_non_finite(v, f"{path}.{k}")
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            _reject_non_finite(v, f"{path}[{i}]")
+    return obj
 
 
 def _to_naive_utc(v: datetime) -> datetime:
@@ -130,6 +144,7 @@ class StrategyCreateIn(BaseModel):
             unknown = set(v) - set(AnomalyType.ALL)
             if unknown:
                 raise ValueError(f"未知异常类型: {sorted(unknown)}")
+            _reject_non_finite(v, "rules")
         return v
 
 
@@ -137,6 +152,16 @@ class StrategyUpdateIn(BaseModel):
     name: Optional[str] = Field(default=None, min_length=1, max_length=128)
     rules: Optional[Dict[str, Dict[str, Any]]] = None
     effective_periods: Optional[List[EffectivePeriodIn]] = None
+
+    @field_validator("rules")
+    @classmethod
+    def check_rules_finite(cls, v):
+        if v is not None:
+            unknown = set(v) - set(AnomalyType.ALL)
+            if unknown:
+                raise ValueError(f"未知异常类型: {sorted(unknown)}")
+            _reject_non_finite(v, "rules")
+        return v
 
 
 class StrategyEnabledIn(BaseModel):

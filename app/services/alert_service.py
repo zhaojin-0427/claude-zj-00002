@@ -21,30 +21,38 @@ def _gen_alert_no() -> str:
 
 def raise_alert(db: Session, device: Device, anomaly_type: str,
                 detail: str, detected_at: datetime,
-                policy: "Optional[EffectivePolicy]" = None) -> Tuple[Alert, bool]:
+                policy: "Optional[EffectivePolicy]" = None,
+                room_no: Optional[str] = None,
+                building: Optional[str] = None) -> Tuple[Alert, bool]:
     """
     触发告警。同一电表同一异常类型存在未闭环告警时，仅刷新最近检出时间（去重），
     返回 (alert, 是否新建)。
 
+    room_no/building 为检出时刻的归属（取自触发读数），缺省才用设备档案当前位置；
+    保证告警归属与命中策略使用的层级位置一致（设备换房后试跑历史数据不串楼）。
+
     新建告警时冻结实际命中的策略版本与完整参数快照；已存在的告警保留首次命中的
-    快照（历史告警不受后续策略变更影响），不会被新策略覆盖。
+    快照与判定依据（历史告警不受后续策略变更影响），不会被新策略覆盖。
     """
+    alert_room = room_no if room_no is not None else device.room_no
+    alert_building = building if building is not None else device.building
     existing = (db.query(Alert)
                 .filter(Alert.meter_no == device.meter_no,
                         Alert.anomaly_type == anomaly_type,
                         Alert.status.in_(AlertStatus.OPEN))
                 .first())
     if existing:
+        # 去重：只刷新最近检出时间。不覆写 detail —— 判定依据与策略快照必须保持
+        # 首次命中（如 v1）的内容，后续发布 v2 再次命中不得改写历史告警。
         if detected_at > existing.last_detected_at:
             existing.last_detected_at = detected_at
-        existing.detail = detail
         return existing, False
 
     alert = Alert(
         alert_no=_gen_alert_no(),
         meter_no=device.meter_no,
-        room_no=device.room_no,
-        building=device.building,
+        room_no=alert_room,
+        building=alert_building,
         anomaly_type=anomaly_type,
         status=AlertStatus.PENDING,
         title=ANOMALY_LABELS.get(anomaly_type, anomaly_type),
@@ -119,6 +127,8 @@ def scan_offline_devices(db: Session, now: Optional[datetime] = None) -> List[Al
                    f"已超过 {rule['offline_minutes']} 分钟未上报（系统默认阈值）",
             detected_at=now,
             policy=policy,
+            room_no=d.room_no,
+            building=d.building,
         )
         if is_new:
             created.append(alert)
