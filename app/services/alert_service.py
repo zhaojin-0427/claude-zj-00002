@@ -1,15 +1,18 @@
 """告警服务：创建/去重、状态机流转、离线扫描与自动恢复。"""
+import json
 import uuid
 from datetime import datetime, timedelta
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, TYPE_CHECKING
 
 from sqlalchemy.orm import Session
 
-from ..config import settings
 from ..constants import (ANOMALY_LABELS, AlertStatus, AnomalyType, TRANSITIONS)
 from ..exceptions import ApiException
 from ..models import Alert, Device
 from ..utils import utcnow
+
+if TYPE_CHECKING:
+    from .policy_service import EffectivePolicy
 
 
 def _gen_alert_no() -> str:
@@ -17,10 +20,14 @@ def _gen_alert_no() -> str:
 
 
 def raise_alert(db: Session, device: Device, anomaly_type: str,
-                detail: str, detected_at: datetime) -> Tuple[Alert, bool]:
+                detail: str, detected_at: datetime,
+                policy: "Optional[EffectivePolicy]" = None) -> Tuple[Alert, bool]:
     """
     触发告警。同一电表同一异常类型存在未闭环告警时，仅刷新最近检出时间（去重），
     返回 (alert, 是否新建)。
+
+    新建告警时冻结实际命中的策略版本与完整参数快照；已存在的告警保留首次命中的
+    快照（历史告警不受后续策略变更影响），不会被新策略覆盖。
     """
     existing = (db.query(Alert)
                 .filter(Alert.meter_no == device.meter_no,
@@ -45,6 +52,11 @@ def raise_alert(db: Session, device: Device, anomaly_type: str,
         first_detected_at=detected_at,
         last_detected_at=detected_at,
     )
+    if policy is not None:
+        snapshot = policy.snapshot_for(anomaly_type, detected_at)
+        alert.strategy_version_id = policy.version_id
+        alert.strategy_scope = policy.scope
+        alert.strategy_snapshot_json = json.dumps(snapshot, ensure_ascii=False)
     db.add(alert)
     db.flush()
     return alert, True
@@ -78,21 +90,38 @@ def transition_alert(db: Session, alert: Alert, target: str,
 
 
 def scan_offline_devices(db: Session, now: Optional[datetime] = None) -> List[Alert]:
-    """扫描超过 OFFLINE_MINUTES 未上报的设备，生成设备离线告警。返回新建告警。"""
+    """扫描超过策略阈值未上报的设备，生成设备离线告警。返回新建告警。
+
+    离线阈值与启停按分层策略逐设备解析（电表＞房间＞楼栋＞全局），
+    设备在其离线策略的生效时段外则不判定离线。
+    """
+    from . import policy_service
+
     now = now or utcnow()
-    cutoff = now - timedelta(minutes=settings.OFFLINE_MINUTES)
-    devices = db.query(Device).filter(Device.last_seen_at.isnot(None),
-                                      Device.last_seen_at < cutoff).all()
+    devices = db.query(Device).filter(Device.last_seen_at.isnot(None)).all()
     created = []
     for d in devices:
-        _, is_new = raise_alert(
+        policy = policy_service.resolve_policy(
+            db, d.meter_no, d.room_no, d.building, now)
+        rule = policy.rule(AnomalyType.DEVICE_OFFLINE)
+        if not rule.get("enabled", True) or not policy.is_effective_at(now):
+            continue
+        cutoff = now - timedelta(minutes=rule["offline_minutes"])
+        if d.last_seen_at >= cutoff:
+            continue
+        alert, is_new = raise_alert(
             db, d, AnomalyType.DEVICE_OFFLINE,
             detail=f"设备最后上报时间 {d.last_seen_at:%Y-%m-%d %H:%M:%S}，"
-                   f"已超过 {settings.OFFLINE_MINUTES} 分钟未上报",
+                   f"已超过 {rule['offline_minutes']} 分钟未上报"
+                   f"（命中{policy.scope}级策略 v{policy.version}）"
+                   if not policy.is_default else
+                   f"设备最后上报时间 {d.last_seen_at:%Y-%m-%d %H:%M:%S}，"
+                   f"已超过 {rule['offline_minutes']} 分钟未上报（系统默认阈值）",
             detected_at=now,
+            policy=policy,
         )
         if is_new:
-            created.append(_)
+            created.append(alert)
     db.commit()
     return created
 

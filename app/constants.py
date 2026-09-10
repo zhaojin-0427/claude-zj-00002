@@ -11,6 +11,18 @@ class AnomalyType:
     ALL = [SUSTAINED_HIGH_LOAD, NIGHT_ACTIVE, POWER_JUMP, SUSPECTED_THEFT, DEVICE_OFFLINE]
 
 
+class StrategyScope:
+    """分层策略层级，数值越大优先级越高（电表＞房间＞楼栋＞全局）。"""
+    GLOBAL = "global"     # 全局
+    BUILDING = "building" # 楼栋
+    ROOM = "room"         # 房间
+    METER = "meter"       # 电表
+
+    ALL = [GLOBAL, BUILDING, ROOM, METER]
+    PRIORITY = {GLOBAL: 0, BUILDING: 1, ROOM: 2, METER: 3}
+    LABELS = {GLOBAL: "全局", BUILDING: "楼栋", ROOM: "房间", METER: "电表"}
+
+
 class AlertStatus:
     PENDING = "pending"               # 待确认
     INVESTIGATING = "investigating"   # 核查中

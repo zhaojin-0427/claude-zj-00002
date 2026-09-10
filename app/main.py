@@ -3,28 +3,30 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from .database import Base, engine
+from .database import ensure_schema_compatible
 from .exceptions import ApiException
 from .response import ok
-from .routers import alerts, devices, ingest, stats
+from .routers import alerts, devices, ingest, stats, strategies
 
-Base.metadata.create_all(bind=engine)
+ensure_schema_compatible()
 
 app = FastAPI(
     title="智能电表用电异常检测与告警归档 API",
-    version="1.0.0",
-    description="电表数据幂等接收、用电异常检测、告警状态流转与统计分析",
+    version="1.1.0",
+    description="电表数据幂等接收、用电异常检测、分层检测策略管理与命中追溯、"
+                "告警状态流转与统计分析",
 )
 
 app.include_router(ingest.router, prefix="/api/v1")
 app.include_router(alerts.router, prefix="/api/v1")
 app.include_router(devices.router, prefix="/api/v1")
 app.include_router(stats.router, prefix="/api/v1")
+app.include_router(strategies.router, prefix="/api/v1")
 
 
 @app.get("/", summary="服务信息")
 def root():
-    return ok({"service": "smart-meter-anomaly-api", "version": "1.0.0", "docs": "/docs"})
+    return ok({"service": "smart-meter-anomaly-api", "version": "1.1.0", "docs": "/docs"})
 
 
 @app.exception_handler(ApiException)

@@ -10,6 +10,10 @@
    （补报场景下序列可能发生变化）按时间序执行；告警按（电表, 异常类型）在未闭环
    期间去重，重复评估不会产生重复告警。
 
+阈值、连续次数、夜间时段等均来自分层检测策略，按读数时刻解析
+"电表＞房间＞楼栋＞全局"的有效策略，全部未命中时使用系统默认（环境变量）。
+去噪参数属于数据预处理范畴，不参与策略分层。
+
 时间约定：所有 reported_at 统一存储为 naive UTC；夜间时段按本地时间判定，
 本地时间 = UTC + LOCAL_UTC_OFFSET_HOURS（默认 8，即北京时间）。
 """
@@ -21,6 +25,7 @@ from sqlalchemy.orm import Session
 from ..config import settings
 from ..constants import AnomalyType
 from ..models import Alert, Device, MeterReading
+from . import policy_service
 from .alert_service import raise_alert, retract_alerts_caused_by_reading
 
 
@@ -49,9 +54,9 @@ def _local_hour(ts: datetime) -> int:
     return (ts + timedelta(hours=settings.LOCAL_UTC_OFFSET_HOURS)).hour
 
 
-def _is_night(ts: datetime) -> bool:
+def _is_night(ts: datetime, start_hour: int, end_hour: int) -> bool:
     h = _local_hour(ts)
-    return h >= settings.NIGHT_START_HOUR or h < settings.NIGHT_END_HOUR
+    return h >= start_hour or h < end_hour
 
 
 def evaluate_pending_denoise(db: Session, meter_no: str) -> None:
@@ -88,13 +93,24 @@ def evaluate_pending_jump(db: Session, device: Device, meter_no: str) -> List[Al
         if r.is_outlier:
             continue
         before = rows[j]
+        # 阈值按被判定读数的时刻与归属解析分层策略
+        policy = policy_service.resolve_policy(
+            db, device.meter_no, r.room_no or device.room_no,
+            r.building or device.building, r.reported_at)
+        rule = policy.rule(AnomalyType.POWER_JUMP)
+        if not rule.get("enabled", True):
+            continue
+        threshold = rule["threshold_kw"]
         delta = abs(r.power - before.power)
-        if delta >= settings.POWER_JUMP_THRESHOLD_KW:
+        if delta >= threshold:
+            tag = ("系统默认阈值" if policy.is_default
+                   else f"命中{policy.scope}级策略 v{policy.version}")
             alert, created = raise_alert(
                 db, device, AnomalyType.POWER_JUMP,
                 detail=f"功率由 {before.power}kW 跳变至 {r.power}kW"
-                       f"（变化 {delta:.2f}kW，阈值 {settings.POWER_JUMP_THRESHOLD_KW}kW）",
+                       f"（变化 {delta:.2f}kW，阈值 {threshold}kW，{tag}）",
                 detected_at=r.reported_at,
+                policy=policy,
             )
             if created:
                 triggered.append(alert)
@@ -103,43 +119,67 @@ def evaluate_pending_jump(db: Session, device: Device, meter_no: str) -> List[Al
 
 def check_sustained_high_load(db: Session, device: Device,
                               current: MeterReading) -> List[Alert]:
-    if current.is_outlier or current.power < settings.HIGH_POWER_THRESHOLD_KW:
+    if current.is_outlier:
         return []
-    n = settings.HIGH_POWER_CONSECUTIVE
+    policy = policy_service.resolve_policy(
+        db, device.meter_no, current.room_no or device.room_no,
+        current.building or device.building, current.reported_at)
+    rule = policy.rule(AnomalyType.SUSTAINED_HIGH_LOAD)
+    if not rule.get("enabled", True):
+        return []
+    threshold = rule["threshold_kw"]
+    n = rule["consecutive"]
+    if current.power < threshold:
+        return []
     recents = _recent_valid(db, current.meter_no, current.reported_at, n)
     if len(recents) < n:
         return []
-    if not all(r.power >= settings.HIGH_POWER_THRESHOLD_KW for r in recents):
+    if not all(r.power >= threshold for r in recents):
         return []
+    tag = ("系统默认阈值" if policy.is_default
+           else f"命中{policy.scope}级策略 v{policy.version}")
     alert, created = raise_alert(
         db, device, AnomalyType.SUSTAINED_HIGH_LOAD,
-        detail=f"连续 {n} 次上报功率超过 {settings.HIGH_POWER_THRESHOLD_KW}kW"
+        detail=f"连续 {n} 次上报功率超过 {threshold}kW"
                f"（{recents[-1].reported_at:%m-%d %H:%M} ~ {current.reported_at:%m-%d %H:%M}，"
-               f"当前 {current.power}kW）",
+               f"当前 {current.power}kW，{tag}）",
         detected_at=current.reported_at,
+        policy=policy,
     )
     return [alert] if created else []
 
 
 def check_night_active(db: Session, device: Device,
                        current: MeterReading) -> List[Alert]:
-    if current.is_outlier or not _is_night(current.reported_at):
+    if current.is_outlier:
         return []
-    if current.power < settings.NIGHT_POWER_THRESHOLD_KW:
+    policy = policy_service.resolve_policy(
+        db, device.meter_no, current.room_no or device.room_no,
+        current.building or device.building, current.reported_at)
+    rule = policy.rule(AnomalyType.NIGHT_ACTIVE)
+    if not rule.get("enabled", True):
         return []
-    n = settings.NIGHT_CONSECUTIVE
+    threshold = rule["threshold_kw"]
+    n = rule["consecutive"]
+    start_hour, end_hour = rule["night_start_hour"], rule["night_end_hour"]
+    if not _is_night(current.reported_at, start_hour, end_hour):
+        return []
+    if current.power < threshold:
+        return []
     recents = _recent_valid(db, current.meter_no, current.reported_at, n)
     if len(recents) < n:
         return []
-    if not all(_is_night(r.reported_at) and r.power >= settings.NIGHT_POWER_THRESHOLD_KW
-               for r in recents):
+    if not all(_is_night(r.reported_at, start_hour, end_hour)
+               and r.power >= threshold for r in recents):
         return []
+    tag = ("系统默认阈值" if policy.is_default
+           else f"命中{policy.scope}级策略 v{policy.version}")
     alert, created = raise_alert(
         db, device, AnomalyType.NIGHT_ACTIVE,
-        detail=f"夜间时段（{settings.NIGHT_START_HOUR}:00-次日{settings.NIGHT_END_HOUR}:00，"
-               f"本地时间）连续 {n} 次功率超过 {settings.NIGHT_POWER_THRESHOLD_KW}kW，"
-               f"当前 {current.power}kW",
+        detail=f"夜间时段（{start_hour}:00-次日{end_hour}:00，本地时间）"
+               f"连续 {n} 次功率超过 {threshold}kW，当前 {current.power}kW（{tag}）",
         detected_at=current.reported_at,
+        policy=policy,
     )
     return [alert] if created else []
 
@@ -148,17 +188,30 @@ def check_suspected_theft(db: Session, device: Device,
                           current: MeterReading) -> List[Alert]:
     if current.is_outlier:
         return []
+    policy = policy_service.resolve_policy(
+        db, device.meter_no, current.room_no or device.room_no,
+        current.building or device.building, current.reported_at)
+    rule = policy.rule(AnomalyType.SUSPECTED_THEFT)
+    if not rule.get("enabled", True):
+        return []
+    min_expected = rule["min_expected_kwh"]
+    tolerance = rule["drop_tolerance"]
     prevs = _recent_valid(db, current.meter_no, current.reported_at, 1, include_end=False)
     if not prevs:
         return []
     prev = prevs[0]
 
+    tag = ("系统默认阈值" if policy.is_default
+           else f"命中{policy.scope}级策略 v{policy.version}")
+
     # 规则1：累计读数回退（表计被篡改的典型特征）
     if current.reading < prev.reading - 1e-6:
         alert, created = raise_alert(
             db, device, AnomalyType.SUSPECTED_THEFT,
-            detail=f"累计读数回退：{prev.reading}kWh -> {current.reading}kWh，疑似表计被篡改",
+            detail=f"累计读数回退：{prev.reading}kWh -> {current.reading}kWh，"
+                   f"疑似表计被篡改（{tag}）",
             detected_at=current.reported_at,
+            policy=policy,
         )
         return [alert] if created else []
 
@@ -168,13 +221,14 @@ def check_suspected_theft(db: Session, device: Device,
         return []
     expected_kwh = (prev.power + current.power) / 2 * hours
     actual_kwh = current.reading - prev.reading
-    if expected_kwh >= settings.THEFT_MIN_EXPECTED_KWH and \
-            actual_kwh < expected_kwh * (1 - settings.THEFT_DROP_TOLERANCE):
+    if expected_kwh >= min_expected and \
+            actual_kwh < expected_kwh * (1 - tolerance):
         alert, created = raise_alert(
             db, device, AnomalyType.SUSPECTED_THEFT,
             detail=f"计量异常：按功率估算电量约 {expected_kwh:.2f}kWh，"
-                   f"表计增量仅 {actual_kwh:.2f}kWh，疑似窃电",
+                   f"表计增量仅 {actual_kwh:.2f}kWh，疑似窃电（{tag}）",
             detected_at=current.reported_at,
+            policy=policy,
         )
         return [alert] if created else []
     return []

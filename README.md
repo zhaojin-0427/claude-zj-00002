@@ -1,14 +1,14 @@
 # 智能电表用电异常检测与告警归档 API
 
-纯后端服务：接收电表通过 **MQTT** 或 **定时 HTTP** 上报的数据，完成幂等接收、实时异常检测、
-告警状态流转与统计分析。统一返回 `{code, message, data}`。
+纯后端服务：接收电表通过 **MQTT** 或 **定时 HTTP** 上报的数据，完成幂等接收、实时异常检测（支持
+**全局/楼栋/房间/电表四级分层检测策略**与命中追溯）、告警状态流转与统计分析。统一返回 `{code, message, data}`。
 
 ## 快速开始
 
 ```bash
 pip install -r requirements.txt
 python run.py                 # http://127.0.0.1:8000/docs
-pytest tests/ -q              # 运行测试（19 个用例）
+pytest tests/ -q              # 运行测试
 ```
 
 可选 MQTT 接入（与 HTTP 共用同一套幂等接收与检测管线）：
@@ -56,6 +56,60 @@ MQTT_HOST=broker.local MQTT_TOPIC='smartmeter/+/reading' python -m app.mqtt_work
 功率跳变等误报。去噪判定延迟一个采样点完成，因此跳变检测也延迟一个采样点评估。
 **若尖峰在被识别为离群点之前已触发告警（如疑似窃电），该告警会自动撤销为「误报」并记录备注。**
 
+## 分层检测策略与命中追溯
+
+检测阈值不再只依赖环境变量，支持按 **全局（global）＞楼栋（building）＞房间（room）＞电表（meter）**
+四级配置，严格按 **电表 ＞ 房间 ＞ 楼栋 ＞ 全局** 的优先级为每台电表、每个检测时刻选择唯一有效策略；
+任一上层级未配置、**未发布**、已停用或不在生效时段内，即向下回退，全部未命中时使用系统默认（环境变量）。
+
+- **草稿与版本分离**：`DetectionStrategy` 是可编辑的工作副本（草稿），检测只认通过
+  `POST /detection-strategies/{id}/publish` 发布的不可变版本（`DetectionStrategyVersion`，版本号自动递增）；
+  **已发布版本禁止直接修改**，改草稿不影响线上检测，需重新发布才生效。
+- **五类异常可分别配置**：阈值、连续次数、单独启停；夜间异常还可自定义夜间起止小时，
+  设备离线可配置离线分钟数。另有按星期 + 本地时间的**生效时段**（可跨夜，如工作日 09:00-18:00；
+  留空表示全天生效）。
+- **命中追溯（快照不可变）**：每条新告警冻结实际命中的策略版本 ID、层级、作用域目标与
+  **完整参数快照**（`alerts.strategy_version_id / strategy_scope / strategy_snapshot_json`，
+  告警详情返回 `strategy_snapshot`）；告警去重刷新时不会覆盖首次命中快照，
+  **后续策略变更/重新发布不影响历史告警**。
+- **只读试跑**：`POST /detection-strategies/trial-run` 指定电表与历史时间范围，在独立内存库中
+  复用现有去噪与检测管线回放，返回预计异常、命中策略与判定依据（`evidence/detail`）；
+  **不写入正式告警、不改变设备状态、不改变正式读数的去噪标记**。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/api/v1/detection-strategies` | 创建策略草稿（scope + 作用域目标 + rules + effective_periods） |
+| GET | `/api/v1/detection-strategies` | 策略查询（层级/楼栋/房间/电表/启停/分页） |
+| GET | `/api/v1/detection-strategies/effective` | 查询某电表某时刻的四级选择链与最终命中 |
+| POST | `/api/v1/detection-strategies/trial-run` | 指定电表+历史区间的只读试跑 |
+| GET | `/api/v1/detection-strategies/{id}` | 策略草稿详情 |
+| PUT | `/api/v1/detection-strategies/{id}` | 编辑草稿（已发布版本不可变，改后需重新发布） |
+| POST | `/api/v1/detection-strategies/{id}/enabled` | 启用/停用 |
+| POST | `/api/v1/detection-strategies/{id}/publish` | 发布新版本（不可变、版本号递增） |
+| GET | `/api/v1/detection-strategies/{id}/versions` | 历史版本列表（只读） |
+
+`rules` 按异常类型部分覆盖默认值，例如：
+
+```json
+{
+  "name": "301房间严格策略", "scope": "room", "building": "A栋", "room_no": "301",
+  "rules": {
+    "sustained_high_load": {"enabled": true, "threshold_kw": 4.0, "consecutive": 2},
+    "night_active": {"threshold_kw": 0.8, "consecutive": 2,
+                     "night_start_hour": 22, "night_end_hour": 6},
+    "power_jump": {"threshold_kw": 2.5},
+    "suspected_theft": {"min_expected_kwh": 0.3, "drop_tolerance": 0.5},
+    "device_offline": {"offline_minutes": 15}
+  },
+  "effective_periods": [
+    {"days_of_week": [1,2,3,4,5], "start": "09:00", "end": "18:00"}
+  ]
+}
+```
+
+数据库变更仅**新增表与可空列**（不改动、不删除既有数据）；历史 `alerts` 行的追溯字段为空，
+接口与原有数据完全兼容。
+
 ## 告警状态机
 
 ```
@@ -89,6 +143,7 @@ pending(待确认) ──▶ investigating(核查中) ──▶ rectified(已整
 | GET | `/api/v1/stats/top-rooms?days=7` | 近 N 天高异常房间排行（含类型分布） |
 | GET | `/api/v1/stats/response-time?days=7` | 告警响应时长分布（分桶 + 均值/中位数/最大值） |
 | GET | `/api/v1/stats/compliance?days=30` | 房间用电合规率（整体 + 分楼栋） |
+| — | `/api/v1/detection-strategies/*` | 分层检测策略、版本发布、命中追溯与只读试跑（见上节） |
 
 ## 统一响应
 
@@ -119,17 +174,20 @@ pending(待确认) ──▶ investigating(核查中) ──▶ rectified(已整
 app/
 ├── config.py            # 阈值与运行配置（环境变量可覆盖）
 ├── database.py          # SQLAlchemy 引擎/会话
-├── models.py            # Device / MeterReading / Alert
+├── models.py            # Device / MeterReading / Alert / DetectionStrategy(+Version)
 ├── schemas.py           # 请求/响应模型
-├── constants.py         # 异常类型、状态机流转表
+├── constants.py         # 异常类型、策略层级、状态机流转表
 ├── response.py          # 统一响应
 ├── exceptions.py        # 业务异常
 ├── services/
 │   ├── ingest_service.py    # 幂等接收管线
-│   ├── detection.py         # 检测引擎（去噪/高负荷/夜间/跳变/窃电）
-│   └── alert_service.py     # 告警去重、状态机、离线扫描、自动恢复
-├── routers/             # readings / alerts / devices / stats
+│   ├── detection.py         # 检测引擎（去噪/高负荷/夜间/跳变/窃电，阈值取自分层策略）
+│   ├── policy_service.py    # 分层策略 CRUD/发布/生效时段/四级策略解析
+│   ├── trial_service.py     # 只读试跑（隔离内存沙箱回放，零副作用）
+│   └── alert_service.py     # 告警去重、命中快照、状态机、离线扫描、自动恢复
+├── routers/             # readings / alerts / devices / stats / strategies
 ├── main.py              # FastAPI 应用与全局异常处理
 └── mqtt_worker.py       # MQTT 订阅接入（可选）
-tests/test_api.py        # 19 个端到端用例
+tests/test_api.py          # 原有端到端用例
+tests/test_strategy.py     # 分层策略/版本/命中追溯/试跑用例
 ```

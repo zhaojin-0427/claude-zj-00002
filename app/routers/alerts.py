@@ -1,5 +1,6 @@
 from datetime import datetime
 from typing import Optional
+import json
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
@@ -17,7 +18,10 @@ router = APIRouter(prefix="/alerts", tags=["告警管理"])
 
 
 def _serialize(a: Alert) -> dict:
-    return AlertOut.model_validate(a).model_dump(mode="json")
+    data = AlertOut.model_validate(a).model_dump(mode="json")
+    data["strategy_snapshot"] = (
+        json.loads(a.strategy_snapshot_json) if a.strategy_snapshot_json else None)
+    return data
 
 
 @router.get("", summary="告警查询（按房间/楼栋/异常类型/状态/时间范围）")
