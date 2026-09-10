@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.coverage
+
+# Django
+*.log
+*.sqlite3
+db.sqlite3
+media/
+staticfiles/
+local_settings.py
+
+# Flask
+instance/
+.webassets-cache
+
+# FastAPI
+.pytest_cache/
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+package-lock.json
+yarn.lock
+
+# React / Vue / Build
+dist/
+build/
+.next/
+.nuxt/
+.cache/
+*.cache
+coverage/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
