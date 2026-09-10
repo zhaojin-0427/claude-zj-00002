@@ -14,19 +14,21 @@ from .alert_service import recover_offline_alerts
 
 def _upsert_device(db: Session, item: ReadingIn) -> Device:
     """建档/更新设备。仅当读数不旧于已知最近上报时间时才更新设备状态，
-    避免乱序补报用旧状态覆盖最新状态。"""
+    避免乱序补报用旧状态覆盖最新状态。last_seen_at 以服务器当前时间上钳制，
+    防止未来时间戳导致设备被视为永久在线。"""
+    seen_at = min(item.reported_at, utcnow())
     device = db.query(Device).filter(Device.meter_no == item.meter_no).first()
     if device is None:
         device = Device(meter_no=item.meter_no, room_no=item.room_no,
                         building=item.building, status=item.device_status,
-                        last_seen_at=item.reported_at)
+                        last_seen_at=seen_at)
         db.add(device)
         db.flush()
     elif device.last_seen_at is None or item.reported_at >= device.last_seen_at:
         device.room_no = item.room_no
         device.building = item.building
         device.status = item.device_status
-        device.last_seen_at = item.reported_at
+        device.last_seen_at = seen_at
     return device
 
 
@@ -49,10 +51,12 @@ def ingest_readings(db: Session, items: List[ReadingIn]) -> dict:
             continue
 
         device = _upsert_device(db, item)
-        # 仅"新鲜"读数（上报时间落在离线窗口内）才能闭环离线告警；
-        # 陈旧补报不代表设备当前已恢复在线
+        # 仅"新鲜"读数（上报时间落在离线窗口内、且不超出允许的未来时钟偏差）
+        # 才能闭环离线告警；陈旧补报或未来时间戳不代表设备当前已恢复在线
         now = utcnow()
-        if item.reported_at >= now - timedelta(minutes=settings.OFFLINE_MINUTES):
+        fresh_lo = now - timedelta(minutes=settings.OFFLINE_MINUTES)
+        fresh_hi = now + timedelta(minutes=settings.MAX_FUTURE_SKEW_MINUTES)
+        if fresh_lo <= item.reported_at <= fresh_hi:
             recover_offline_alerts(db, device, now)
 
         reading = MeterReading(

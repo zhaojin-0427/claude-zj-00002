@@ -67,6 +67,8 @@ def transition_alert(db: Session, alert: Alert, target: str,
     alert.status = target
     if target in AlertStatus.TERMINAL:
         alert.resolved_at = now
+    else:
+        alert.resolved_at = None  # 重新打开（如已整改->核查中），清除原解决时间
     if note:
         stamp = now.strftime("%Y-%m-%d %H:%M:%S")
         alert.note = (alert.note + "\n" if alert.note else "") + f"[{stamp}] {note}"
@@ -110,6 +112,9 @@ def recover_offline_alerts(db: Session, device: Device, at: datetime) -> None:
         resolved_at = max(at, a.first_detected_at)
         a.status = AlertStatus.RECOVERED
         a.resolved_at = resolved_at
+        # 系统自动确认恢复：响应时长 = 检出到恢复的耗时，不计入"未响应"
+        a.acknowledged_at = resolved_at
+        a.response_seconds = max(0.0, (resolved_at - a.first_detected_at).total_seconds())
         a.note = (a.note + "\n" if a.note else "") + \
                  f"[{resolved_at:%Y-%m-%d %H:%M:%S}] 设备恢复上报，系统自动置为已恢复"
 

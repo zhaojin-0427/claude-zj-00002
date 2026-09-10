@@ -33,7 +33,8 @@ MQTT_HOST=broker.local MQTT_TOPIC='smartmeter/+/reading' python -m app.mqtt_work
 
 - **幂等接收**：`(meter_no, reported_at)` 唯一约束，重复上报返回 `duplicates` 计数，不产生重复数据、不重复触发告警；
 - 设备首次上报自动建档；`device_status`、房间、楼栋按"最新上报时间优先"同步（乱序补报不会用旧状态覆盖新状态）；
-- 设备恢复上报时自动闭环其「设备离线」告警（置为已恢复）——仅**新鲜读数**（上报时间落在离线窗口内）可触发恢复，陈旧补报不会；
+- 设备恢复上报时自动闭环其「设备离线」告警（置为已恢复）——仅**新鲜读数**（上报时间落在离线窗口内，且不超出 `MAX_FUTURE_SKEW_MINUTES` 未来时钟偏差）可触发恢复，陈旧补报或未来时间戳不会；自动恢复会记录 `acknowledged_at` 与 `response_seconds`（= 检出到恢复耗时），不计入"未响应"；
+- 设备 `last_seen_at` 以服务器当前时间上钳制：未来时间戳的读数不会让设备永久显示在线；
 - 响应中直接返回本次上报新触发的告警 `alerts_triggered`。
 
 **时间约定**：`reported_at` 统一按 naive UTC 存储（带时区偏移的时间会转换为 UTC，如 `23:00+08:00` 存为 `15:00Z`）；夜间时段按本地时间判定，本地时间 = UTC + `LOCAL_UTC_OFFSET_HOURS`（默认 8，即北京时间）。
@@ -65,7 +66,14 @@ pending(待确认) ──▶ investigating(核查中) ──▶ rectified(已整
 ```
 
 - 离开 `pending` 时自动记录响应时长 `response_seconds`；进入终态记录 `resolved_at`；
+- 从终态重新打开（如已整改 → 核查中）时清空 `resolved_at`，保留首次响应记录；
 - 非法流转返回 `40001`；同一电表同一异常类型的未闭环告警自动去重（仅刷新最近检出时间）。
+
+## 统计口径
+
+- 所有统计窗口为 **[now − N天, now]**：未来时间（如设备时钟错误）产生的告警不计入排行、响应时长分布与合规率；
+- 高异常房间排行按 **楼栋+房间** 聚合，异常类型分布同样按楼栋隔离，不同楼栋的相同房号互不干扰；
+- 合规率按 **房间** 口径统计：同一房间存在多块电表只计一个房间，任一表在周期内有非误报告警则该房间不合规。
 
 ## 主要接口
 
@@ -102,6 +110,7 @@ pending(待确认) ──▶ investigating(核查中) ──▶ rectified(已整
 | `OUTLIER_NEIGHBOR_MAX_KW` / `OUTLIER_MIN_SPIKE_KW` / `OUTLIER_FACTOR` | `2.0`/`3.0`/`5.0` | 离群值去噪 |
 | `THEFT_MIN_EXPECTED_KWH` / `THEFT_DROP_TOLERANCE` | `0.5`/`0.6` | 疑似窃电 |
 | `OFFLINE_MINUTES` | `30` | 设备离线 |
+| `MAX_FUTURE_SKEW_MINUTES` | `5` | 允许的未来时钟偏差 |
 | `MQTT_HOST` / `MQTT_PORT` / `MQTT_TOPIC` / `MQTT_USERNAME` / `MQTT_PASSWORD` | — | MQTT 接入 |
 
 ## 项目结构

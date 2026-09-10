@@ -40,6 +40,9 @@ class Settings:
 
     # ---- 设备离线 ----
     OFFLINE_MINUTES: int = _int("OFFLINE_MINUTES", 30)
+    # 上报时间允许的未来时钟偏差（超出视为非新鲜数据，不恢复离线告警；
+    # 设备 last_seen_at 也以此钳制，避免未来时间戳导致设备永久在线）
+    MAX_FUTURE_SKEW_MINUTES: int = _int("MAX_FUTURE_SKEW_MINUTES", 5)
 
     # ---- MQTT（可选） ----
     MQTT_ENABLED: bool = os.getenv("MQTT_ENABLED", "false").lower() == "true"

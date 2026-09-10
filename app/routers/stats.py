@@ -24,7 +24,10 @@ def top_rooms(days: int = Query(7, ge=1, le=90),
               building: Optional[str] = None,
               db: Session = Depends(get_db)):
     since = utcnow() - timedelta(days=days)
+    now = utcnow()
+    # 统计窗口 [now-days, now]：未来时间（如设备时钟错误）的告警不计入
     base = db.query(Alert).filter(Alert.first_detected_at >= since,
+                                  Alert.first_detected_at <= now,
                                   Alert.status != AlertStatus.FALSE_POSITIVE)
     if building:
         base = base.filter(Alert.building == building)
@@ -35,16 +38,17 @@ def top_rooms(days: int = Query(7, ge=1, le=90),
             .order_by(func.count().desc())
             .limit(limit).all())
 
-    # 每个房间的异常类型分布
-    type_rows = (base.with_entities(Alert.room_no, Alert.anomaly_type, func.count())
-                 .group_by(Alert.room_no, Alert.anomaly_type).all())
+    # 每个房间的异常类型分布（按 楼栋+房间 归属，避免不同楼栋同房号串数据）
+    type_rows = (base.with_entities(Alert.room_no, Alert.building,
+                                    Alert.anomaly_type, func.count())
+                 .group_by(Alert.room_no, Alert.building, Alert.anomaly_type).all())
     type_map = {}
-    for room, atype, cnt in type_rows:
-        type_map.setdefault(room, {})[atype] = cnt
+    for room, bldg, atype, cnt in type_rows:
+        type_map.setdefault((room, bldg), {})[atype] = cnt
 
     items = [
         {"rank": i + 1, "room_no": r.room_no, "building": r.building,
-         "alert_count": r.cnt, "type_breakdown": type_map.get(r.room_no, {})}
+         "alert_count": r.cnt, "type_breakdown": type_map.get((r.room_no, r.building), {})}
         for i, r in enumerate(rows)
     ]
     return ok({"days": days, "items": items})
@@ -55,7 +59,9 @@ def response_time(days: int = Query(7, ge=1, le=90),
                   building: Optional[str] = None,
                   db: Session = Depends(get_db)):
     since = utcnow() - timedelta(days=days)
-    q = db.query(Alert).filter(Alert.first_detected_at >= since)
+    now = utcnow()
+    q = db.query(Alert).filter(Alert.first_detected_at >= since,
+                               Alert.first_detected_at <= now)
     if building:
         q = q.filter(Alert.building == building)
     alerts = q.all()
@@ -94,23 +100,26 @@ def compliance(days: int = Query(30, ge=1, le=365),
                building: Optional[str] = None,
                db: Session = Depends(get_db)):
     since = utcnow() - timedelta(days=days)
+    now = utcnow()
     dev_q = db.query(Device)
     if building:
         dev_q = dev_q.filter(Device.building == building)
-    devices = dev_q.all()
+    # 合规率按"房间"口径统计：同一房间多块电表只算一个房间
+    rooms = {(d.building, d.room_no) for d in dev_q.all()}
 
-    # 周期内有非误报告警的电表视为不合规
-    violating = {row[0] for row in
-                 db.query(Alert.meter_no)
+    # 周期内有非误报告警（未来时间的告警不计入）的房间视为不合规
+    violating = {(r[0], r[1]) for r in
+                 db.query(Alert.building, Alert.room_no)
                  .filter(Alert.first_detected_at >= since,
+                         Alert.first_detected_at <= now,
                          Alert.status != AlertStatus.FALSE_POSITIVE)
                  .distinct().all()}
 
     by_building = {}
-    for d in devices:
-        g = by_building.setdefault(d.building, {"total_rooms": 0, "non_compliant_rooms": 0})
+    for bldg, room in rooms:
+        g = by_building.setdefault(bldg, {"total_rooms": 0, "non_compliant_rooms": 0})
         g["total_rooms"] += 1
-        if d.meter_no in violating:
+        if (bldg, room) in violating:
             g["non_compliant_rooms"] += 1
 
     groups = []
